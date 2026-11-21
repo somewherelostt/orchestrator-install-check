@@ -376,24 +376,14 @@ jobs:
           '{"enabled":true,"channel":"latest","nightlyAck":false,"feature":null}' | Set-Content "$st\run\update-settings.json"
           $env:AO_DATA_DIR = "$st\data"; $env:AO_RUN_FILE = "$st\run\running.json"
           $proc = Start-Process $exe -PassThru
-          $pending = "$env:LOCALAPPDATA\agent-orchestrator-updater\pending"
-          $feed = (Invoke-WebRequest "https://github.com/$env:REPO/releases/latest/download/latest.yml").Content
-          $wantSize = [int64](([regex]::Match($feed, 'size:\s*(\d+)')).Groups[1].Value)
-          $sw = [Diagnostics.Stopwatch]::StartNew(); $got = $null
+          $log = "$st\run\logs\updater.jsonl"
+          $sw = [Diagnostics.Stopwatch]::StartNew(); $ok = $false
           while ($sw.Elapsed.TotalMinutes -lt 20) {
-            # electron-updater writes temp-<name> while downloading, then renames.
-            $got = Get-ChildItem $pending -Filter "*.exe" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match [regex]::Escape($env:VERSION) -and $_.Name -notmatch '^temp-' -and $_.Length -eq $wantSize } | Select-Object -First 1
-            if ($got) { break }
-            Start-Sleep 10
+            if (Select-String -Path $log -Pattern ('"event":"archive-downloaded".*"targetVersion":"' + $env:VERSION + '"') -Quiet -ErrorAction SilentlyContinue) { $ok = $true; break }
+            Start-Sleep 5
           }
-          if ($got) {
-            $want = $feed
-            $sha = [Convert]::ToBase64String([Security.Cryptography.SHA512]::Create().ComputeHash([IO.File]::ReadAllBytes($got.FullName)))
-            if ($want -match [regex]::Escape($sha)) { Rec "win-update:n-1-to-n-staged" PASS "$env:PREV staged $($got.Name) in $([int]$sw.Elapsed.TotalSeconds)s; sha512 matches latest.yml" }
-            else { Rec "win-update:n-1-to-n-staged" FAIL "staged $($got.Name) but sha512 does not match latest.yml" }
-          } else {
-            Rec "win-update:n-1-to-n-staged" FAIL "no $env:VERSION installer in $pending after 20 min"
-          }
+          if ($ok) { Rec "win-update:n-1-to-n-downloaded" PASS "$env:PREV downloaded $env:VERSION (sha512 verified by electron-updater) in $([int]$sw.Elapsed.TotalSeconds)s" }
+          else { Rec "win-update:n-1-to-n-downloaded" FAIL "no archive-downloaded for $env:VERSION in 20 min" }
           Get-Content "$st\run\logs\updater.jsonl" -ErrorAction SilentlyContinue | Select-Object -Last 15
           # Install-on-quit: ask the window to close, as a user would.
           $proc.CloseMainWindow() | Out-Null
@@ -401,8 +391,8 @@ jobs:
           Get-Process agent-orchestrator -ErrorAction SilentlyContinue | Stop-Process -Force
           Start-Sleep 30
           $after = (Get-Item $exe).VersionInfo.ProductVersion
-          if ($after -like "$env:VERSION*") { Rec "win-update:installed-on-quit" PASS "now $after" }
-          else { Rec "win-update:installed-on-quit" INFO "still $after after closing the window (app may stay in the tray; install runs on a full quit)" }
+          if ($after -like "$env:VERSION*") { Rec "win-update:installed-on-quit" PASS "closing the app installed it: exe is now $after" }
+          else { Rec "win-update:installed-on-quit" FAIL "still $after after the app quit" }
       - name: Results
         if: always()
         shell: bash
@@ -539,6 +529,7 @@ jobs:
     timeout-minutes: 40
     env:
       JOB_LABEL: linux-update
+      GH_TOKEN: ${{ github.token }}
       VERSION: ${{ needs.resolve.outputs.version }}
       PREV: ${{ needs.resolve.outputs.prev_tag }}
     steps:
@@ -564,21 +555,23 @@ jobs:
           fi
           pkill -f "$img" 2>/dev/null || true
           xvfb-run -a "$img" --no-sandbox >"$d/app.log" 2>&1 &
-          pending=$HOME/.cache/agent-orchestrator-updater/pending
-          got=""
+          # The app downloads N, installs it and relaunches itself; success is
+          # a process reporting runningVersion N and the AppImage file being N.
+          log=$st/run/logs/updater.jsonl
+          start=$(date +%s); ok=no
           for i in $(seq 1 120); do
-            got=$(ls "$pending"/*"$VERSION"*.AppImage 2>/dev/null | head -1)
-            [ -n "$got" ] && grep -q archive-downloaded "$st/run/logs/updater.jsonl" 2>/dev/null && break
+            if grep -q "\"runningVersion\":\"$VERSION\"" "$log" 2>/dev/null; then ok=yes; break; fi
             sleep 10
           done
-          if [ -n "$got" ]; then
-            want=$(curl -fsSL "https://github.com/$REPO/releases/latest/download/latest-linux.yml" | sed -n 's/^sha512: *//p')
-            have=$(openssl dgst -sha512 -binary "$got" | base64 -w0)
-            eq linux-update:n-1-to-n-staged "$want" "$have" "sha512 of staged $(basename "$got")"
+          if [ $ok = yes ]; then
+            dl=$(grep -c '"event":"archive-downloaded"' "$log")
+            pass linux-update:n-1-to-n "$PREV -> $VERSION: downloaded, installed and relaunched as $VERSION in $(( $(date +%s) - start ))s"
           else
-            fail linux-update:n-1-to-n-staged "no $VERSION AppImage staged in $pending after 20 min"
+            fail linux-update:n-1-to-n "app never relaunched as $VERSION in 20 min"
             tail -30 "$d/app.log"
           fi
+          want=$(gh api "repos/$REPO/releases/latest" --jq '.assets[]|select(.name=="agent-orchestrator-linux-x64.AppImage")|.digest' | sed 's/^sha256://')
+          eq linux-update:appimage-replaced "$want" "$(sha256sum "$img" | cut -d' ' -f1)" "sha256 of the AppImage file the user launched"
           tail -15 "$st/run/logs/updater.jsonl" 2>/dev/null || true
           pkill -f "$img" 2>/dev/null || true
       - name: Results
