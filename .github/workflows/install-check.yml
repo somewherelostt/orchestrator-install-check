@@ -44,6 +44,7 @@ env:
     deb:ao-on-path rpm:ao-on-path appimage:ao-on-path
     deb:apt-repo rpm:dnf-repo deb:homepage rpm:homepage rpm:license
     linuxbrew:cask npm:stale-ao npm:shadows-cask
+    mac-update:quit-exits
 
 jobs:
   resolve:
@@ -225,40 +226,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: echo "RESULTS=$RUNNER_TEMP/results-$JOB_LABEL.tsv" >>"$GITHUB_ENV"
-      # The upstream harness is public and dependency-free; use it as-is.
-      - uses: actions/checkout@v4
-        with:
-          repository: OrchestratorInc/agent-orchestrator
-          path: upstream
-          sparse-checkout: |
-            frontend/scripts/e2e-mac-update.mjs
-            frontend/scripts/verify-mac-artifact.sh
-          sparse-checkout-cone-mode: false
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
       - name: Install N-1 and update to N
-        run: |
-          . scripts/lib.sh
-          d=$(mktemp -d)
-          curl -fsSL "https://github.com/$REPO/releases/download/$PREV/agent-orchestrator-darwin-arm64.zip" -o "$d/prev.zip"
-          rm -rf "/Applications/Agent Orchestrator.app"
-          ditto -x -k "$d/prev.zip" /Applications
-          info update:baseline "$(plutil -extract CFBundleShortVersionString raw -o - '/Applications/Agent Orchestrator.app/Contents/Info.plist')"
-          start=$(date +%s)
-          if node upstream/frontend/scripts/e2e-mac-update.mjs --app "/Applications/Agent Orchestrator.app" --expect-version "$VERSION" --channel latest --swap-timeout 900 >update.log 2>&1; then
-            pass mac-update:n-1-to-n "$PREV -> $VERSION staged, installed on quit, relaunched healthy ($(( $(date +%s) - start ))s)"
-          else
-            fail mac-update:n-1-to-n "$(tail -5 update.log)"
-          fi
-          tail -40 update.log
-          bash scripts/mac-assert.sh after-update "/Applications/Agent Orchestrator.app" no || true
-          mkdir -p "$RUNNER_TEMP/diag"
-          cp update.log "$RUNNER_TEMP/diag/" 2>/dev/null
-          cp -R ~/Library/Caches/dev.agent-orchestrator.desktop.ShipIt "$RUNNER_TEMP/diag/ShipIt" 2>/dev/null
-          cp ~/.ao/logs/updater.jsonl* ~/.ao/logs/desktop-lifecycle.jsonl "$RUNNER_TEMP/diag/" 2>/dev/null
-          echo "--- ShipIt stderr"; tail -40 ~/Library/Caches/dev.agent-orchestrator.desktop.ShipIt/ShipIt_stderr.log 2>/dev/null
-          echo "--- updater.jsonl"; tail -25 ~/.ao/logs/updater.jsonl 2>/dev/null
-          grep -vE 'msg="http request"|scm observer|level=DEBUG' update.log | grep -vE '^time=' | tail -40
+        run: bash scripts/mac-update.sh
       - name: Results
         if: always()
         run: . scripts/lib.sh && finish
@@ -546,34 +515,40 @@ jobs:
           st=$d/state; mkdir -p "$st/run"
           echo '{"enabled":true,"channel":"latest","nightlyAck":false,"feature":null}' >"$st/run/update-settings.json"
           export AO_DATA_DIR=$st/data AO_RUN_FILE=$st/run/running.json
-          # First try exactly as a user would launch it (sandbox on).
-          timeout 40 xvfb-run -a "$img" >"$d/plain.log" 2>&1; rc=$?
+          # Sandbox check on a throwaway copy, so it cannot touch the test image.
+          cp "$img" "$d/sbx.AppImage"
+          timeout -s KILL 30 xvfb-run -a "$d/sbx.AppImage" >"$d/plain.log" 2>&1; rc=$?
           if grep -qiE 'sandbox|SUID' "$d/plain.log"; then
             fail linux-update:appimage-sandbox "AppImage does not start on $(. /etc/os-release; echo "$PRETTY_NAME") without --no-sandbox: $(grep -iE 'sandbox' "$d/plain.log" | head -1)"
           else
-            info linux-update:appimage-sandbox "plain launch exit $rc (124 = still running at timeout, i.e. it started)"
+            info linux-update:appimage-sandbox "plain launch exit $rc (137 = still running when killed, i.e. it started)"
           fi
-          pkill -f "$img" 2>/dev/null || true
-          xvfb-run -a "$img" --no-sandbox >"$d/app.log" 2>&1 &
-          # The app downloads N, installs it and relaunches itself; success is
-          # a process reporting runningVersion N and the AppImage file being N.
+          pkill -9 -f "sbx.AppImage|/tmp/.mount_" 2>/dev/null; sleep 2
+          rm -rf "$st/run/logs" "$HOME/.cache/agent-orchestrator-updater"
+
           log=$st/run/logs/updater.jsonl
+          xvfb-run -a "$img" --no-sandbox >"$d/app.log" 2>&1 &
           start=$(date +%s); ok=no
-          for i in $(seq 1 120); do
-            if grep -q "\"runningVersion\":\"$VERSION\"" "$log" 2>/dev/null; then ok=yes; break; fi
-            sleep 10
+          for i in $(seq 1 180); do
+            grep -q "\"event\":\"archive-downloaded\".*\"targetVersion\":\"$VERSION\"" "$log" 2>/dev/null && ok=yes && break
+            sleep 5
           done
-          if [ $ok = yes ]; then
-            dl=$(grep -c '"event":"archive-downloaded"' "$log")
-            pass linux-update:n-1-to-n "$PREV -> $VERSION: downloaded, installed and relaunched as $VERSION in $(( $(date +%s) - start ))s"
-          else
-            fail linux-update:n-1-to-n "app never relaunched as $VERSION in 20 min"
-            tail -30 "$d/app.log"
-          fi
+          if [ $ok = yes ]; then pass linux-update:downloaded "$PREV downloaded $VERSION (sha512 checked by electron-updater) in $(( $(date +%s) - start ))s"
+          else fail linux-update:downloaded "no $VERSION download in 15 min"; tail -30 "$d/app.log"; fi
+          # Quit gracefully (SIGTERM to the Electron main process, as logout or a
+          # tray Quit ends it). electron-updater installs the AppImage on quit.
+          main=$(pgrep -f '/tmp/.mount_.*/agent-orchestrator' | while read p; do tr '\0' ' ' </proc/$p/cmdline | grep -q -- '--type=' || echo $p; done | head -1)
+          info linux-update:main-pid "${main:-none}"
+          [ -n "$main" ] && kill -TERM "$main"
+          for i in $(seq 1 30); do [ -n "$main" ] && kill -0 "$main" 2>/dev/null || break; sleep 2; done
+          if [ -n "$main" ] && kill -0 "$main" 2>/dev/null; then fail linux-update:quit-exits "app still running 60s after SIGTERM"; pkill -9 -f '/tmp/.mount_'; else pass linux-update:quit-exits "app exited on SIGTERM"; fi
+          sleep 10
           want=$(gh api "repos/$REPO/releases/latest" --jq '.assets[]|select(.name=="agent-orchestrator-linux-x64.AppImage")|.digest' | sed 's/^sha256://')
-          eq linux-update:appimage-replaced "$want" "$(sha256sum "$img" | cut -d' ' -f1)" "sha256 of the AppImage file the user launched"
-          tail -15 "$st/run/logs/updater.jsonl" 2>/dev/null || true
-          pkill -f "$img" 2>/dev/null || true
+          eq linux-update:appimage-replaced "$want" "$(sha256sum "$img" | cut -d' ' -f1)" "sha256 of the AppImage file the user launched, after quit"
+          xvfb-run -a "$img" --no-sandbox >"$d/app2.log" 2>&1 &
+          ok=no
+          for i in $(seq 1 24); do grep -q "\"runningVersion\":\"$VERSION\"" "$log" 2>/dev/null && ok=yes && break; sleep 5; done
+          [ $ok = yes ] && pass linux-update:relaunch "relaunched app runs $VERSION" || fail linux-update:relaunch "relaunched app is not $VERSION"
       - name: deb N-1 -> N (does a .deb install update itself?)
         run: |
           . scripts/lib.sh
