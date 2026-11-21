@@ -35,9 +35,9 @@ eq "$P:feed-repo" OrchestratorInc/agent-orchestrator "$(sed -n 's/^owner: *//p' 
 
 AO="$APP/Contents/Resources/daemon/ao"
 TH=$(mktemp -d)
-run_ao() { env HOME="$TH" AO_DATA_DIR="$TH/data" AO_RUN_FILE="$TH/run/running.json" AO_PORT=39117 "$@"; }
+run_ao() { HOME="$TH" AO_DATA_DIR="$TH/data" AO_RUN_FILE="$TH/run/running.json" AO_PORT=39117 "$@"; }
 if [ -x "$AO" ]; then
-	out=$(run_ao timeout 60 "$AO" version 2>&1 | head -1)
+	out=$(run_ao tmo 60 "$AO" version 2>&1 | head -1)
 	case $out in "$V"*) pass "$P:bundled-ao" "$out" ;; *) fail "$P:bundled-ao" "bundled ao version: $out" ;; esac
 else
 	fail "$P:bundled-ao" "no $AO"
@@ -49,14 +49,14 @@ all=$(zsh -lc 'which -a ao' 2>/dev/null | tr '\n' ' ' || true)
 info "$P:which-a-ao" "${all:-none}"
 if [ "$EXPECT_AO" = yes ]; then
 	if [ -n "$resolved" ]; then
-		out=$(zsh -lc "export HOME='$TH' AO_DATA_DIR='$TH/data' AO_RUN_FILE='$TH/run/running.json' AO_PORT=39117; timeout 60 ao version" 2>&1 | head -1)
+		out=$(zsh -lc "export HOME='$TH' AO_DATA_DIR='$TH/data' AO_RUN_FILE='$TH/run/running.json' AO_PORT=39117; perl -e 'alarm 60; exec @ARGV' ao version" 2>&1 | head -1)
 		case $out in "$V"*) pass "$P:ao-on-path" "$resolved -> $out" ;; *) fail "$P:ao-on-path" "$resolved runs '$out', not $V" ;; esac
 	else
 		fail "$P:ao-on-path" "ao not found in a fresh login shell"
 	fi
 else
 	if [ -n "$resolved" ]; then
-		out=$(zsh -lc "export HOME='$TH' AO_DATA_DIR='$TH/data' AO_RUN_FILE='$TH/run/running.json' AO_PORT=39117; timeout 60 ao version" 2>&1 | head -1)
+		out=$(zsh -lc "export HOME='$TH' AO_DATA_DIR='$TH/data' AO_RUN_FILE='$TH/run/running.json' AO_PORT=39117; perl -e 'alarm 60; exec @ARGV' ao version" 2>&1 | head -1)
 		info "$P:ao-on-path" "this channel does not link ao, but $resolved is on PATH ($out)"
 	else
 		fail "$P:ao-on-path" "this channel leaves no ao on PATH (user must link it by hand)"
@@ -65,6 +65,9 @@ fi
 
 if [ "${LAUNCH:-0}" = 1 ]; then
 	LH=$(mktemp -d)
+	# Seed update prefs next to the run file, or the first-run dialog blocks boot.
+	mkdir -p "$LH/run"
+	echo '{"enabled":true,"channel":"latest","nightlyAck":false,"feature":null}' >"$LH/run/update-settings.json"
 	exe=$(plutil -extract CFBundleExecutable raw -o - "$plist")
 	env HOME="$HOME" AO_DATA_DIR="$LH/data" AO_RUN_FILE="$LH/run/running.json" \
 		"$APP/Contents/MacOS/$exe" >"$LH/app.log" 2>&1 &

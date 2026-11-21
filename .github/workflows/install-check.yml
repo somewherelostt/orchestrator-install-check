@@ -38,9 +38,9 @@ env:
     exists:install.sh exists:install.ps1 exists:cli/install.ps1 exists:install.md
     tap-binary npm-deprecated aur scoop
     tap:ao-on-path install-sh:ao-on-path dmg:ao-on-path zip:ao-on-path
-    exe:ao-on-path exe:display-name exe:start-menu
-    winget:ao-on-path winget:display-name winget:start-menu
-    choco:ao-on-path choco:display-name choco:start-menu
+    exe:ao-on-path exe:display-name exe:start-menu exe:signature exe:installer-signature
+    winget:ao-on-path winget:display-name winget:start-menu winget:signature
+    choco:ao-on-path choco:display-name choco:start-menu choco:signature
     deb:ao-on-path rpm:ao-on-path appimage:ao-on-path
     deb:apt-repo rpm:dnf-repo deb:homepage rpm:homepage rpm:license
     linuxbrew:cask npm:stale-ao npm:shadows-cask
@@ -138,7 +138,7 @@ jobs:
           npm i -g @aoagents/ao >/dev/null 2>&1 || true
           first=$(zsh -lc 'command -v ao')
           all=$(zsh -lc 'which -a ao' | tr '\n' ' ')
-          out=$(zsh -lc "export HOME=$(mktemp -d); timeout 30 ao --version 2>&1 || timeout 30 ao version 2>&1" | head -1)
+          out=$(zsh -lc "export HOME=$(mktemp -d); perl -e 'alarm 30; exec @ARGV' ao version 2>&1" | head -1)
           case $first in
             "$(brew --prefix)/bin/ao") pass npm:shadows-cask "cask ao still wins: $all" ;;
             *) fail npm:shadows-cask "after npm i -g @aoagents/ao, a new shell runs $first ($out); all: $all" ;;
@@ -283,6 +283,10 @@ jobs:
           switch ($P) {
             "exe" {
               Invoke-WebRequest "https://github.com/$env:REPO/releases/latest/download/agent-orchestrator-win32-x64.exe" -OutFile "$env:RUNNER_TEMP\setup.exe"
+              $sig = Get-AuthenticodeSignature "$env:RUNNER_TEMP\setup.exe"
+              if ($sig.Status -eq "Valid") { Rec "exe:installer-signature" PASS "setup exe signed: $($sig.SignerCertificate.Subject)" }
+              elseif ($env:KNOWN_ISSUES -match "exe:installer-signature") { Rec "exe:installer-signature" KNOWN "setup exe Authenticode $($sig.Status): SmartScreen shows 'unknown publisher'" }
+              else { Rec "exe:installer-signature" FAIL "setup exe Authenticode $($sig.Status)" }
               $p = Start-Process "$env:RUNNER_TEMP\setup.exe" -ArgumentList "/S" -Wait -PassThru
               $code = $p.ExitCode
             }
@@ -363,16 +367,17 @@ jobs:
           $env:AO_DATA_DIR = "$st\data"; $env:AO_RUN_FILE = "$st\run\running.json"
           $proc = Start-Process $exe -PassThru
           $pending = "$env:LOCALAPPDATA\agent-orchestrator-updater\pending"
+          $feed = (Invoke-WebRequest "https://github.com/$env:REPO/releases/latest/download/latest.yml").Content
+          $wantSize = [int64](([regex]::Match($feed, 'size:\s*(\d+)')).Groups[1].Value)
           $sw = [Diagnostics.Stopwatch]::StartNew(); $got = $null
           while ($sw.Elapsed.TotalMinutes -lt 20) {
-            $got = Get-ChildItem $pending -Filter "*.exe" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match [regex]::Escape($env:VERSION) } | Select-Object -First 1
-            $log = Get-Content "$st\run\logs\updater.jsonl" -ErrorAction SilentlyContinue | Select-String "archive-downloaded"
-            if ($got -and $log) { break }
-            if ($got -and $sw.Elapsed.TotalMinutes -gt 1 -and -not (Test-Path "$st\run\logs\updater.jsonl")) { break }
+            # electron-updater writes temp-<name> while downloading, then renames.
+            $got = Get-ChildItem $pending -Filter "*.exe" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match [regex]::Escape($env:VERSION) -and $_.Name -notmatch '^temp-' -and $_.Length -eq $wantSize } | Select-Object -First 1
+            if ($got) { break }
             Start-Sleep 10
           }
           if ($got) {
-            $want = (Invoke-WebRequest "https://github.com/$env:REPO/releases/latest/download/latest.yml").Content
+            $want = $feed
             $sha = [Convert]::ToBase64String([Security.Cryptography.SHA512]::Create().ComputeHash([IO.File]::ReadAllBytes($got.FullName)))
             if ($want -match [regex]::Escape($sha)) { Rec "win-update:n-1-to-n-staged" PASS "$env:PREV staged $($got.Name) in $([int]$sw.Elapsed.TotalSeconds)s; sha512 matches latest.yml" }
             else { Rec "win-update:n-1-to-n-staged" FAIL "staged $($got.Name) but sha512 does not match latest.yml" }

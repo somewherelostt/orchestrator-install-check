@@ -42,6 +42,13 @@ check() {
 	if "$@" >/dev/null 2>&1; then pass "$id" "$what"; else fail "$id" "$what"; fi
 }
 
+# tmo <seconds> <command...>: GNU timeout is missing on macOS runners.
+tmo() {
+	local t=$1
+	shift
+	if command -v timeout >/dev/null 2>&1; then timeout "$t" "$@"; else perl -e 'alarm shift; exec @ARGV' "$t" "$@"; fi
+}
+
 # http_status <url>: final status code after redirects.
 http_status() { curl -sSL -o /dev/null -w '%{http_code}' --retry 2 "$1" 2>/dev/null || echo 000; }
 
