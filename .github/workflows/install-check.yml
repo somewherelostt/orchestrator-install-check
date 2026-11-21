@@ -574,6 +574,34 @@ jobs:
           eq linux-update:appimage-replaced "$want" "$(sha256sum "$img" | cut -d' ' -f1)" "sha256 of the AppImage file the user launched"
           tail -15 "$st/run/logs/updater.jsonl" 2>/dev/null || true
           pkill -f "$img" 2>/dev/null || true
+      - name: deb N-1 -> N (does a .deb install update itself?)
+        run: |
+          . scripts/lib.sh
+          d=$(mktemp -d)
+          curl -fsSL "https://github.com/$REPO/releases/download/$PREV/agent-orchestrator-linux-x64.deb" -o "$d/prev.deb"
+          sudo apt-get install -y -qq "$d/prev.deb" >/dev/null 2>&1
+          info deb-update:baseline "$(dpkg-query -W -f='${Version}' agent-orchestrator)"
+          ls /usr/lib/agent-orchestrator/resources/ | tr '\n' ' '; echo
+          st=$d/state; mkdir -p "$st/run"
+          echo '{"enabled":true,"channel":"latest","nightlyAck":false,"feature":null}' >"$st/run/update-settings.json"
+          export AO_DATA_DIR=$st/data AO_RUN_FILE=$st/run/running.json
+          xvfb-run -a /usr/bin/agent-orchestrator --no-sandbox >"$d/app.log" 2>&1 &
+          log=$st/run/logs/updater.jsonl
+          for i in $(seq 1 36); do
+            grep -qE '"event":"(archive-downloaded|update-failure|electron-updater-error)"' "$log" 2>/dev/null && break
+            sleep 5
+          done
+          sleep 60
+          ev=$(grep -oE '"event":"[a-z-]+"' "$log" 2>/dev/null | sort | uniq -c | tr '\n' ' ')
+          err=$(grep -E 'update-failure|electron-updater-error' "$log" 2>/dev/null | head -1 | grep -oE '"message":"[^"]{0,200}' | head -1)
+          now=$(dpkg-query -W -f='${Version}' agent-orchestrator)
+          if [ "$now" = "$VERSION" ] || grep -q "\"runningVersion\":\"$VERSION\"" "$log" 2>/dev/null; then
+            pass deb-update:n-1-to-n "deb updated itself to $VERSION"
+          else
+            fail deb-update:n-1-to-n "deb install stays on $now: events [$ev] ${err}"
+          fi
+          tail -12 "$log" 2>/dev/null | cut -c1-400
+          pkill -f agent-orchestrator 2>/dev/null || true
       - name: Results
         if: always()
         run: . scripts/lib.sh && finish
