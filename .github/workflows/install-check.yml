@@ -21,6 +21,12 @@ concurrency:
   group: install-check
   cancel-in-progress: false
 
+# No -e: every check records its own result, and one failing command must not
+# skip the checks after it. finish() decides the step's exit code.
+defaults:
+  run:
+    shell: bash --noprofile --norc {0}
+
 env:
   REPO: OrchestratorInc/agent-orchestrator
   # Broken things we already know about. A FAIL on one of these ids is
@@ -397,6 +403,7 @@ jobs:
     env:
       JOB_LABEL: linux-deb-appimage
       VERSION: ${{ needs.resolve.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
       B: https://github.com/OrchestratorInc/agent-orchestrator/releases/latest/download
     steps:
       - uses: actions/checkout@v4
@@ -452,7 +459,15 @@ jobs:
           (cd "$T" && HOME=$T AO_DATA_DIR=$T/data AO_RUN_FILE=$T/run/running.json AO_PORT=39118 CI=1 \
             timeout 150 "$T/npm/bin/ao" start >"$T/start.log" 2>&1); rc=$?
           info npm:ao-start "exit $rc: $(grep -vE '^\s*$' "$T/start.log" | tail -4 | tr '\n' ' ' | cut -c1-400)"
-          info npm:ao-start-files "$(find "$T" -maxdepth 4 \( -iname '*.AppImage' -o -iname '*orchestrator*' \) -not -path "*/npm/*" 2>/dev/null | head -5 | tr '\n' ' ')"
+          img=$(find "$T" -maxdepth 4 -iname '*.AppImage' -not -path "*/npm/*" 2>/dev/null | head -1)
+          if [ -n "$img" ]; then
+            want=$(gh api "repos/$REPO/releases/latest" --jq '.assets[]|select(.name=="agent-orchestrator-linux-x64.AppImage")|.digest' | sed 's/^sha256://')
+            have=$(sha256sum "$img" | cut -d' ' -f1)
+            if [ "$want" = "$have" ]; then pass npm:ao-start-fetches-latest "ao start fetched the current $VERSION AppImage to $img"
+            else fail npm:ao-start-fetches-latest "ao start fetched an AppImage that is not the current release ($img)"; fi
+          else
+            info npm:ao-start-fetches-latest "no AppImage fetched"
+          fi
           pkill -f "$T" 2>/dev/null || true
       - name: Results
         if: always()
