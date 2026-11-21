@@ -131,7 +131,7 @@ done <links.txt
 [ "$bad" = 0 ] && pass links "$(wc -l <links.txt | tr -d ' ') release links on the website and README all resolve"
 
 grep -qiE 'brew install' download.html && pass page-shows-brew "download page shows a brew command" || fail page-shows-brew "download page shows no brew / winget / CLI install command"
-grep -q "nightly.*rpm\|/$NIGHTLY_TAG/agent-orchestrator-linux-x64.rpm" download.html && pass page-nightly-rpm "nightly rpm linked" || warn page-nightly-rpm "nightly rpm is published but not linked on the download page"
+grep -q "/$NIGHTLY_TAG/agent-orchestrator-linux-x64.rpm" download.html && pass page-nightly-rpm "nightly rpm linked" || warn page-nightly-rpm "nightly rpm is published but not linked on the download page"
 
 # --- 4. Install scripts -------------------------------------------------------
 s=$(curl -sS -o install.sh -w '%{http_code}' https://orchestrator.inc/cli/install.sh)

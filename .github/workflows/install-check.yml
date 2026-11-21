@@ -44,7 +44,7 @@ env:
     deb:ao-on-path rpm:ao-on-path appimage:ao-on-path
     deb:apt-repo rpm:dnf-repo deb:homepage rpm:homepage rpm:license
     linuxbrew:cask npm:stale-ao npm:shadows-cask
-    mac-update:quit-exits
+    mac-update:quit-exits deb-update:n-1-to-n
 
 jobs:
   resolve:
@@ -515,17 +515,6 @@ jobs:
           st=$d/state; mkdir -p "$st/run"
           echo '{"enabled":true,"channel":"latest","nightlyAck":false,"feature":null}' >"$st/run/update-settings.json"
           export AO_DATA_DIR=$st/data AO_RUN_FILE=$st/run/running.json
-          # Sandbox check on a throwaway copy, so it cannot touch the test image.
-          cp "$img" "$d/sbx.AppImage"
-          timeout -s KILL 30 xvfb-run -a "$d/sbx.AppImage" >"$d/plain.log" 2>&1; rc=$?
-          if grep -qiE 'sandbox|SUID' "$d/plain.log"; then
-            fail linux-update:appimage-sandbox "AppImage does not start on $(. /etc/os-release; echo "$PRETTY_NAME") without --no-sandbox: $(grep -iE 'sandbox' "$d/plain.log" | head -1)"
-          else
-            info linux-update:appimage-sandbox "plain launch exit $rc (137 = still running when killed, i.e. it started)"
-          fi
-          pkill -9 -f "sbx.AppImage|/tmp/.mount_" 2>/dev/null; sleep 2
-          rm -rf "$st/run/logs" "$HOME/.cache/agent-orchestrator-updater"
-
           log=$st/run/logs/updater.jsonl
           xvfb-run -a "$img" --no-sandbox >"$d/app.log" 2>&1 &
           start=$(date +%s); ok=no
@@ -549,6 +538,18 @@ jobs:
           ok=no
           for i in $(seq 1 24); do grep -q "\"runningVersion\":\"$VERSION\"" "$log" 2>/dev/null && ok=yes && break; sleep 5; done
           [ $ok = yes ] && pass linux-update:relaunch "relaunched app runs $VERSION" || fail linux-update:relaunch "relaunched app is not $VERSION"
+          pkill -9 -f '/tmp/.mount_' 2>/dev/null; sleep 2
+          curl -fsSL "https://github.com/$REPO/releases/latest/download/agent-orchestrator-linux-x64.AppImage" -o "$d/cur.AppImage"; chmod +x "$d/cur.AppImage"
+          # Sandbox check on a throwaway copy, so it cannot touch the test image.
+          mv "$d/cur.AppImage" "$d/sbx.AppImage"
+          AO_DATA_DIR=$d/sbx/data AO_RUN_FILE=$d/sbx/run/running.json timeout -s KILL 30 xvfb-run -a "$d/sbx.AppImage" >"$d/plain.log" 2>&1; rc=$?
+          if grep -qiE 'sandbox|SUID' "$d/plain.log"; then
+            fail linux-update:appimage-sandbox "AppImage does not start on $(. /etc/os-release; echo "$PRETTY_NAME") without --no-sandbox: $(grep -iE 'sandbox' "$d/plain.log" | head -1)"
+          else
+            info linux-update:appimage-sandbox "plain launch exit $rc (137 = still running when killed, i.e. it started)"
+          fi
+          pkill -9 -f "sbx.AppImage|/tmp/.mount_" 2>/dev/null; sleep 2
+
       - name: deb N-1 -> N (does a .deb install update itself?)
         run: |
           . scripts/lib.sh
@@ -573,7 +574,7 @@ jobs:
           if [ "$now" = "$VERSION" ] || grep -q "\"runningVersion\":\"$VERSION\"" "$log" 2>/dev/null; then
             pass deb-update:n-1-to-n "deb updated itself to $VERSION"
           else
-            fail deb-update:n-1-to-n "deb install stays on $now: events [$ev] ${err}"
+            fail deb-update:n-1-to-n "deb install stays on $now and its updater never ran (events: [${ev:-none}]) ${err}"
           fi
           tail -12 "$log" 2>/dev/null | cut -c1-400
           pkill -f agent-orchestrator 2>/dev/null || true
