@@ -266,8 +266,8 @@ jobs:
               if ($sig.Status -eq "Valid") { Rec "exe:installer-signature" PASS "setup exe signed: $($sig.SignerCertificate.Subject)" }
               elseif ($env:KNOWN_ISSUES -match "exe:installer-signature") { Rec "exe:installer-signature" KNOWN "setup exe Authenticode $($sig.Status): SmartScreen shows 'unknown publisher'" }
               else { Rec "exe:installer-signature" FAIL "setup exe Authenticode $($sig.Status)" }
-              $p = Start-Process "$env:RUNNER_TEMP\setup.exe" -ArgumentList "/S" -Wait -PassThru
-              $code = $p.ExitCode
+              $proc = Start-Process "$env:RUNNER_TEMP\setup.exe" -ArgumentList "/S" -Wait -PassThru
+              $code = $proc.ExitCode
             }
             "winget" {
               if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
