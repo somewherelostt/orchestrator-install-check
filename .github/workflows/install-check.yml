@@ -1,0 +1,583 @@
+name: Install channels
+
+# Installs Orchestrator (desktop app + ao CLI) through every public channel on
+# clean GitHub-hosted runners and asserts what a new user would get.
+# Read-only against upstream: it never pushes, comments or files anything.
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # nightly, after the upstream nightly build
+  workflow_dispatch:
+    inputs:
+      skip_update:
+        description: "Skip the N-1 -> N updater jobs (they take ~15 min each)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-check
+  cancel-in-progress: false
+
+env:
+  REPO: OrchestratorInc/agent-orchestrator
+  # Broken things we already know about. A FAIL on one of these ids is
+  # reported as KNOWN (yellow) so the nightly turns red only on regressions.
+  # Remove an id once its fix ships.
+  KNOWN_ISSUES: >-
+    legacy-dmg-alias-still-published sha256sums arm64-linux-windows
+    page-shows-brew install-sh-old-tap install-sh-linux
+    exists:install.sh exists:install.ps1 exists:cli/install.ps1 exists:install.md
+    tap-binary npm-deprecated aur scoop
+    tap:ao-on-path install-sh:ao-on-path dmg:ao-on-path zip:ao-on-path
+    exe:ao-on-path exe:display-name exe:start-menu
+    winget:ao-on-path winget:display-name winget:start-menu
+    choco:ao-on-path choco:display-name choco:start-menu
+    deb:ao-on-path rpm:ao-on-path appimage:ao-on-path
+    deb:apt-repo rpm:dnf-repo deb:homepage rpm:homepage rpm:license
+    linuxbrew:cask npm:stale-ao npm:shadows-cask
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.r.outputs.version }}
+      tag: ${{ steps.r.outputs.tag }}
+      prev_tag: ${{ steps.r.outputs.prev_tag }}
+      nightly_tag: ${{ steps.r.outputs.nightly_tag }}
+    steps:
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(gh api "repos/$REPO/releases/latest" --jq .tag_name)
+          prev=$(gh api "repos/$REPO/releases?per_page=60" --jq '[.[] | select(.prerelease|not) | select(.draft|not) | .tag_name] | .[1]')
+          nightly=$(gh api "repos/$REPO/releases?per_page=30" --jq '[.[] | select(.prerelease) | select(.tag_name|test("nightly")) | .tag_name] | .[0]')
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >>"$GITHUB_OUTPUT"
+          echo "prev_tag=$prev" >>"$GITHUB_OUTPUT"
+          echo "nightly_tag=$nightly" >>"$GITHUB_OUTPUT"
+          echo "latest $tag, previous stable $prev, newest nightly $nightly" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  meta:
+    needs: resolve
+    runs-on: ubuntu-latest
+    env:
+      JOB_LABEL: meta
+      VERSION: ${{ needs.resolve.outputs.version }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      NIGHTLY_TAG: ${{ needs.resolve.outputs.nightly_tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "RESULTS=$RUNNER_TEMP/results-$JOB_LABEL.tsv" >>"$GITHUB_ENV"
+      - run: bash scripts/meta-check.sh
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: "results-meta", path: "${{ runner.temp }}/results-*.tsv", if-no-files-found: ignore }
+
+  # ---------------------------------------------------------------- macOS ----
+  mac-brew:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, arch: arm64, channel: cask }
+          - { os: macos-15-intel, arch: x64, channel: cask }
+          - { os: macos-14, arch: arm64, channel: tap }
+          - { os: macos-14, arch: arm64, channel: install-sh }
+    runs-on: ${{ matrix.os }}
+    env:
+      JOB_LABEL: mac-${{ matrix.channel }}-${{ matrix.arch }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      APP: /Applications/Agent Orchestrator.app
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "RESULTS=$RUNNER_TEMP/results-$JOB_LABEL.tsv" >>"$GITHUB_ENV"
+      - name: Install
+        run: |
+          . scripts/lib.sh
+          P=${{ matrix.channel }}
+          brew update --quiet >/dev/null 2>&1 || true
+          start=$(date +%s)
+          case $P in
+            cask)       cmd="brew install --cask agent-orchestrator" ;;
+            tap)        cmd="brew install --cask agentwrapper/tap/agent-orchestrator" ;;
+            install-sh) cmd="sh -c 'curl -fsSL https://orchestrator.inc/cli/install.sh | sh'" ;;
+          esac
+          if eval "$cmd" >install.log 2>&1; then
+            pass "$P:install" "$cmd ($(( $(date +%s) - start ))s)"
+          else
+            fail "$P:install" "$cmd exited non-zero: $(tail -3 install.log)"
+          fi
+          tail -20 install.log
+          info "$P:brew-info" "$(brew info --cask agent-orchestrator 2>/dev/null | sed -n '1p;/^From:/p' | tr '\n' ' ')"
+          grep -q "Run ao" install.log && info "$P:install-message" "script tells the user to run ao"
+          exit 0
+      - name: Assert
+        run: |
+          expect=no; [ "${{ matrix.channel }}" = cask ] && expect=yes
+          LAUNCH=$([ "${{ matrix.channel }}" = cask ] && echo 1 || echo 0) \
+            bash scripts/mac-assert.sh ${{ matrix.channel }} "$APP" $expect
+      - name: Stale npm ao shadows the cask?
+        if: matrix.channel == 'cask' && matrix.arch == 'arm64'
+        run: |
+          . scripts/lib.sh
+          npm i -g @aoagents/ao >/dev/null 2>&1 || true
+          first=$(zsh -lc 'command -v ao')
+          all=$(zsh -lc 'which -a ao' | tr '\n' ' ')
+          out=$(zsh -lc "export HOME=$(mktemp -d); timeout 30 ao --version 2>&1 || timeout 30 ao version 2>&1" | head -1)
+          case $first in
+            "$(brew --prefix)/bin/ao") pass npm:shadows-cask "cask ao still wins: $all" ;;
+            *) fail npm:shadows-cask "after npm i -g @aoagents/ao, a new shell runs $first ($out); all: $all" ;;
+          esac
+          npm rm -g @aoagents/ao >/dev/null 2>&1 || true
+      - name: Uninstall
+        if: always()
+        run: |
+          . scripts/lib.sh
+          P=${{ matrix.channel }}
+          prefix=$(brew --prefix)
+          if [ "$P" = cask ]; then tok=agent-orchestrator; else tok=agentwrapper/tap/agent-orchestrator; fi
+          brew uninstall --cask --zap "$tok" >uninstall.log 2>&1 || fail "$P:uninstall" "$(tail -3 uninstall.log)"
+          left=""
+          [ -d "$APP" ] && left="$left app;"
+          [ -e "$prefix/bin/ao" ] && left="$left $prefix/bin/ao;"
+          [ -d "$prefix/Caskroom/agent-orchestrator" ] && left="$left Caskroom;"
+          if [ -z "$left" ]; then pass "$P:uninstall-clean" "app and ao link removed"; else fail "$P:uninstall-clean" "left behind:$left"; fi
+          info "$P:user-data-after-zap" "$(ls -d ~/.ao ~/Library/Application\ Support/*rchestrator* ~/Library/Logs/*rchestrator* ~/Library/Caches/agent-orchestrator* 2>/dev/null | tr '\n' ';' || true)"
+      - name: Results
+        if: always()
+        run: . scripts/lib.sh && finish
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: "results-${{ env.JOB_LABEL }}", path: "${{ runner.temp }}/results-*.tsv", if-no-files-found: ignore }
+
+  mac-direct:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, arch: arm64 }
+          - { os: macos-15-intel, arch: x64 }
+    runs-on: ${{ matrix.os }}
+    env:
+      JOB_LABEL: mac-direct-${{ matrix.arch }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      B: https://github.com/OrchestratorInc/agent-orchestrator/releases/latest/download
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "RESULTS=$RUNNER_TEMP/results-$JOB_LABEL.tsv" >>"$GITHUB_ENV"
+      - name: DMG (the website and README button)
+        run: |
+          . scripts/lib.sh
+          a=${{ matrix.arch }}
+          d=$(mktemp -d)
+          curl -fsSL "$B/Orchestrator-darwin-$a.dmg" -o "$d/o.dmg" || fail dmg:download "Orchestrator-darwin-$a.dmg"
+          sp=$(spctl -a -t open --context context:primary-signature -vv "$d/o.dmg" 2>&1 | tr '\n' ' ')
+          case $sp in *accepted*) pass dmg:gatekeeper "$sp" ;; *) fail dmg:gatekeeper "$sp" ;; esac
+          check dmg:stapled "dmg notarization ticket stapled" xcrun stapler validate "$d/o.dmg"
+          mnt=$(hdiutil attach -nobrowse -readonly "$d/o.dmg" | awk -F'\t' '/\/Volumes\//{print $NF}' | tail -1)
+          info dmg:volume "mounted at '$mnt': $(ls "$mnt" | tr '\n' ',')"
+          rm -rf "/Applications/Agent Orchestrator.app"
+          ditto "$mnt/Agent Orchestrator.app" "/Applications/Agent Orchestrator.app"
+          hdiutil detach "$mnt" -quiet || true
+          bash scripts/mac-assert.sh dmg "/Applications/Agent Orchestrator.app" no
+          rm -rf "/Applications/Agent Orchestrator.app"
+      - name: ZIP (version-free alias)
+        run: |
+          . scripts/lib.sh
+          a=${{ matrix.arch }}
+          d=$(mktemp -d)
+          curl -fsSL "$B/agent-orchestrator-darwin-$a.zip" -o "$d/a.zip"
+          ditto -x -k "$d/a.zip" /Applications
+          bash scripts/mac-assert.sh zip "/Applications/Agent Orchestrator.app" no
+          rm -rf "/Applications/Agent Orchestrator.app"
+      - name: Results
+        if: always()
+        run: . scripts/lib.sh && finish
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: "results-${{ env.JOB_LABEL }}", path: "${{ runner.temp }}/results-*.tsv", if-no-files-found: ignore }
+
+  mac-update:
+    needs: resolve
+    if: ${{ !inputs.skip_update }}
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      JOB_LABEL: mac-update
+      VERSION: ${{ needs.resolve.outputs.version }}
+      PREV: ${{ needs.resolve.outputs.prev_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "RESULTS=$RUNNER_TEMP/results-$JOB_LABEL.tsv" >>"$GITHUB_ENV"
+      # The upstream harness is public and dependency-free; use it as-is.
+      - uses: actions/checkout@v4
+        with:
+          repository: OrchestratorInc/agent-orchestrator
+          path: upstream
+          sparse-checkout: |
+            frontend/scripts/e2e-mac-update.mjs
+            frontend/scripts/verify-mac-artifact.sh
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Install N-1 and update to N
+        run: |
+          . scripts/lib.sh
+          d=$(mktemp -d)
+          curl -fsSL "https://github.com/$REPO/releases/download/$PREV/agent-orchestrator-darwin-arm64.zip" -o "$d/prev.zip"
+          rm -rf "/Applications/Agent Orchestrator.app"
+          ditto -x -k "$d/prev.zip" /Applications
+          info update:baseline "$(plutil -extract CFBundleShortVersionString raw -o - '/Applications/Agent Orchestrator.app/Contents/Info.plist')"
+          start=$(date +%s)
+          if node upstream/frontend/scripts/e2e-mac-update.mjs --app "/Applications/Agent Orchestrator.app" --expect-version "$VERSION" --channel latest >update.log 2>&1; then
+            pass mac-update:n-1-to-n "$PREV -> $VERSION staged, installed on quit, relaunched healthy ($(( $(date +%s) - start ))s)"
+          else
+            fail mac-update:n-1-to-n "$(tail -5 update.log)"
+          fi
+          tail -40 update.log
+          bash scripts/mac-assert.sh after-update "/Applications/Agent Orchestrator.app" no || true
+      - name: Results
+        if: always()
+        run: . scripts/lib.sh && finish
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: "results-${{ env.JOB_LABEL }}", path: "${{ runner.temp }}/results-*.tsv", if-no-files-found: ignore }
+
+  # -------------------------------------------------------------- Windows ----
+  windows:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [exe, winget, choco]
+    runs-on: windows-latest
+    env:
+      JOB_LABEL: win-${{ matrix.channel }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        run: '"RESULTS=$env:RUNNER_TEMP\results-$env:JOB_LABEL.tsv" >> $env:GITHUB_ENV'
+      - name: Install
+        shell: pwsh
+        run: |
+          $P = "${{ matrix.channel }}"
+          function Rec($id, $s, $m) { Add-Content $env:RESULTS "$env:JOB_LABEL`t$id`t$s`t$m" -Encoding utf8; Write-Host "[$s] ${id}: $m" }
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          switch ($P) {
+            "exe" {
+              Invoke-WebRequest "https://github.com/$env:REPO/releases/latest/download/agent-orchestrator-win32-x64.exe" -OutFile "$env:RUNNER_TEMP\setup.exe"
+              $p = Start-Process "$env:RUNNER_TEMP\setup.exe" -ArgumentList "/S" -Wait -PassThru
+              $code = $p.ExitCode
+            }
+            "winget" {
+              if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+                Install-Module Microsoft.WinGet.Client -Force -Scope CurrentUser -AllowClobber | Out-Null
+                Repair-WinGetPackageManager -Latest -Force | Out-Null
+              }
+              Rec "winget:client" INFO "winget $(winget --version)"
+              winget show --id OrchestratorInc.AgentOrchestrator -e --accept-source-agreements | Out-String | Write-Host
+              winget install --id OrchestratorInc.AgentOrchestrator -e --silent --scope user --accept-package-agreements --accept-source-agreements --disable-interactivity
+              $code = $LASTEXITCODE
+            }
+            "choco" {
+              choco install agent-orchestrator -y --no-progress
+              $code = $LASTEXITCODE
+            }
+          }
+          if ($code -eq 0) { Rec "${P}:install" PASS "exit 0 in $([int]$sw.Elapsed.TotalSeconds)s" }
+          else { Rec "${P}:install" FAIL "exit $code" }
+          # The installer may leave the app running; it would hold files open.
+          Start-Sleep 5
+          Get-Process agent-orchestrator -ErrorAction SilentlyContinue | Stop-Process -Force
+      - name: Assert
+        shell: pwsh
+        run: ./scripts/win-assert.ps1 -Prefix ${{ matrix.channel }} -Mode installed -ExpectAo no
+      - name: Uninstall
+        if: always()
+        shell: pwsh
+        run: |
+          $P = "${{ matrix.channel }}"
+          Get-Process agent-orchestrator -ErrorAction SilentlyContinue | Stop-Process -Force
+          switch ($P) {
+            "winget" { winget uninstall --id OrchestratorInc.AgentOrchestrator -e --silent --disable-interactivity }
+            "choco"  { choco uninstall agent-orchestrator -y --no-progress }
+            default {
+              $u = Get-ChildItem "$env:LOCALAPPDATA\Programs\agent-orchestrator" -Filter "Uninstall*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($u) { Start-Process $u.FullName -ArgumentList "/S" -Wait }
+            }
+          }
+          Start-Sleep 10
+          ./scripts/win-assert.ps1 -Prefix $P -Mode uninstalled
+      - name: Results
+        if: always()
+        shell: bash
+        run: . scripts/lib.sh && finish
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: "results-${{ env.JOB_LABEL }}", path: "${{ runner.temp }}/results-*.tsv", if-no-files-found: ignore }
+
+  windows-update:
+    needs: resolve
+    if: ${{ !inputs.skip_update }}
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      JOB_LABEL: win-update
+      VERSION: ${{ needs.resolve.outputs.version }}
+      PREV: ${{ needs.resolve.outputs.prev_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        run: '"RESULTS=$env:RUNNER_TEMP\results-$env:JOB_LABEL.tsv" >> $env:GITHUB_ENV'
+      - name: Install N-1, launch, wait for N to download
+        shell: pwsh
+        run: |
+          function Rec($id, $s, $m) { Add-Content $env:RESULTS "$env:JOB_LABEL`t$id`t$s`t$m" -Encoding utf8; Write-Host "[$s] ${id}: $m" }
+          $prev = $env:PREV.TrimStart("v")
+          Invoke-WebRequest "https://github.com/$env:REPO/releases/download/$env:PREV/agent-orchestrator-win32-x64.exe" -OutFile "$env:RUNNER_TEMP\prev.exe"
+          Start-Process "$env:RUNNER_TEMP\prev.exe" -ArgumentList "/S" -Wait
+          Start-Sleep 5
+          Get-Process agent-orchestrator -ErrorAction SilentlyContinue | Stop-Process -Force
+          $exe = "$env:LOCALAPPDATA\Programs\agent-orchestrator\agent-orchestrator.exe"
+          Rec "update:baseline" INFO "installed $((Get-Item $exe).VersionInfo.ProductVersion)"
+          $st = "$env:RUNNER_TEMP\aostate"
+          New-Item -ItemType Directory "$st\run" -Force | Out-Null
+          '{"enabled":true,"channel":"latest","nightlyAck":false,"feature":null}' | Set-Content "$st\run\update-settings.json"
+          $env:AO_DATA_DIR = "$st\data"; $env:AO_RUN_FILE = "$st\run\running.json"
+          $proc = Start-Process $exe -PassThru
+          $pending = "$env:LOCALAPPDATA\agent-orchestrator-updater\pending"
+          $sw = [Diagnostics.Stopwatch]::StartNew(); $got = $null
+          while ($sw.Elapsed.TotalMinutes -lt 20) {
+            $got = Get-ChildItem $pending -Filter "*.exe" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match [regex]::Escape($env:VERSION) } | Select-Object -First 1
+            $log = Get-Content "$st\run\logs\updater.jsonl" -ErrorAction SilentlyContinue | Select-String "archive-downloaded"
+            if ($got -and $log) { break }
+            if ($got -and $sw.Elapsed.TotalMinutes -gt 1 -and -not (Test-Path "$st\run\logs\updater.jsonl")) { break }
+            Start-Sleep 10
+          }
+          if ($got) {
+            $want = (Invoke-WebRequest "https://github.com/$env:REPO/releases/latest/download/latest.yml").Content
+            $sha = [Convert]::ToBase64String([Security.Cryptography.SHA512]::Create().ComputeHash([IO.File]::ReadAllBytes($got.FullName)))
+            if ($want -match [regex]::Escape($sha)) { Rec "win-update:n-1-to-n-staged" PASS "$env:PREV staged $($got.Name) in $([int]$sw.Elapsed.TotalSeconds)s; sha512 matches latest.yml" }
+            else { Rec "win-update:n-1-to-n-staged" FAIL "staged $($got.Name) but sha512 does not match latest.yml" }
+          } else {
+            Rec "win-update:n-1-to-n-staged" FAIL "no $env:VERSION installer in $pending after 20 min"
+          }
+          Get-Content "$st\run\logs\updater.jsonl" -ErrorAction SilentlyContinue | Select-Object -Last 15
+          # Install-on-quit: ask the window to close, as a user would.
+          $proc.CloseMainWindow() | Out-Null
+          Start-Sleep 90
+          Get-Process agent-orchestrator -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep 30
+          $after = (Get-Item $exe).VersionInfo.ProductVersion
+          if ($after -like "$env:VERSION*") { Rec "win-update:installed-on-quit" PASS "now $after" }
+          else { Rec "win-update:installed-on-quit" INFO "still $after after closing the window (app may stay in the tray; install runs on a full quit)" }
+      - name: Results
+        if: always()
+        shell: bash
+        run: . scripts/lib.sh && finish
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: "results-${{ env.JOB_LABEL }}", path: "${{ runner.temp }}/results-*.tsv", if-no-files-found: ignore }
+
+  # ---------------------------------------------------------------- Linux ----
+  linux-deb-appimage:
+    needs: resolve
+    runs-on: ubuntu-latest
+    env:
+      JOB_LABEL: linux-deb-appimage
+      VERSION: ${{ needs.resolve.outputs.version }}
+      B: https://github.com/OrchestratorInc/agent-orchestrator/releases/latest/download
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "RESULTS=$RUNNER_TEMP/results-$JOB_LABEL.tsv" >>"$GITHUB_ENV"
+      - name: deb
+        run: |
+          . scripts/lib.sh
+          d=$(mktemp -d)
+          curl -fsSL "$B/agent-orchestrator-linux-x64.deb" -o "$d/a.deb"
+          dpkg-deb -f "$d/a.deb" Package Version Homepage Maintainer >"$d/meta"
+          cat "$d/meta"
+          eq deb:version "$VERSION" "$(dpkg-deb -f "$d/a.deb" Version)" "deb Version"
+          eq deb:homepage https://orchestrator.inc "$(dpkg-deb -f "$d/a.deb" Homepage | sed 's#/$##')" "deb Homepage"
+          sudo apt-get update -qq >/dev/null
+          start=$(date +%s)
+          if sudo apt-get install -y -qq "$d/a.deb" >"$d/install.log" 2>&1; then pass deb:install "apt install ./deb ($(( $(date +%s) - start ))s)"; else fail deb:install "$(tail -3 "$d/install.log")"; fi
+          eq deb:dpkg-version "$VERSION" "$(dpkg-query -W -f='${Version}' agent-orchestrator 2>/dev/null)" "dpkg-query version"
+          root=$(dirname "$(readlink -f /usr/bin/agent-orchestrator)")
+          info deb:files "launcher /usr/bin/agent-orchestrator -> $root"
+          bash scripts/linux-assert.sh deb "$root" /usr/share/applications/agent-orchestrator.desktop no
+          if ls /etc/apt/sources.list.d/ 2>/dev/null | grep -qi orchestrator; then pass deb:apt-repo "apt source added"; else fail deb:apt-repo "no apt repository: apt upgrade will never update the app, and deb installs do not self-update"; fi
+          sudo apt-get purge -y -qq agent-orchestrator >/dev/null 2>&1
+          left=$(ls -d /usr/lib/agent-orchestrator /opt/*rchestrator* /usr/bin/agent-orchestrator /usr/share/applications/agent-orchestrator.desktop 2>/dev/null | tr '\n' ' ')
+          [ -z "$left" ] && pass deb:uninstall-clean "purge removed everything" || fail deb:uninstall-clean "left: $left"
+      - name: AppImage
+        run: |
+          . scripts/lib.sh
+          d=$(mktemp -d)
+          curl -fsSL "$B/agent-orchestrator-linux-x64.AppImage" -o "$d/a.AppImage"
+          chmod +x "$d/a.AppImage"
+          (cd "$d" && ./a.AppImage --appimage-extract >/dev/null 2>&1)
+          bash scripts/linux-assert.sh appimage "$d/squashfs-root" "$(ls "$d"/squashfs-root/*.desktop | head -1)" no
+      - name: Homebrew on Linux (cask)
+        run: |
+          . scripts/lib.sh
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)" 2>/dev/null || true
+          if command -v brew >/dev/null; then
+            if brew install --cask agent-orchestrator >"$RUNNER_TEMP/lb.log" 2>&1; then pass linuxbrew:cask "brew install --cask works on Linux"
+            else fail linuxbrew:cask "$(grep -iE 'error|linux' "$RUNNER_TEMP/lb.log" | head -2)"; fi
+          else
+            info linuxbrew:cask "brew not on this runner"
+          fi
+      - name: npm @aoagents/ao
+        run: |
+          . scripts/lib.sh
+          T=$(mktemp -d)
+          export npm_config_prefix=$T/npm HOME_SAVE=$HOME
+          npm i -g @aoagents/ao >"$T/npm.log" 2>&1 && pass npm:install "npm i -g @aoagents/ao" || fail npm:install "$(tail -3 "$T/npm.log")"
+          grep -iE 'deprecat|warn' "$T/npm.log" | head -3 || true
+          v=$(HOME=$T AO_DATA_DIR=$T/data AO_RUN_FILE=$T/run/running.json timeout 60 "$T/npm/bin/ao" --version 2>&1 | head -1)
+          case $v in "$VERSION"*|*" $VERSION"*) pass npm:stale-ao "npm ao is current: $v" ;; *) fail npm:stale-ao "npm i -g @aoagents/ao puts ao $v on PATH (app is $VERSION)" ;; esac
+          # What `ao start` does today for a brand-new user (bounded, isolated).
+          (cd "$T" && HOME=$T AO_DATA_DIR=$T/data AO_RUN_FILE=$T/run/running.json AO_PORT=39118 CI=1 \
+            timeout 150 "$T/npm/bin/ao" start >"$T/start.log" 2>&1); rc=$?
+          info npm:ao-start "exit $rc: $(grep -vE '^\s*$' "$T/start.log" | tail -4 | tr '\n' ' ' | cut -c1-400)"
+          info npm:ao-start-files "$(find "$T" -maxdepth 4 \( -iname '*.AppImage' -o -iname '*orchestrator*' \) -not -path "*/npm/*" 2>/dev/null | head -5 | tr '\n' ' ')"
+          pkill -f "$T" 2>/dev/null || true
+      - name: Results
+        if: always()
+        run: . scripts/lib.sh && finish
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: "results-${{ env.JOB_LABEL }}", path: "${{ runner.temp }}/results-*.tsv", if-no-files-found: ignore }
+
+  linux-rpm:
+    needs: resolve
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    env:
+      JOB_LABEL: linux-rpm
+      VERSION: ${{ needs.resolve.outputs.version }}
+      B: https://github.com/OrchestratorInc/agent-orchestrator/releases/latest/download
+    steps:
+      - run: dnf install -y -q git tar findutils procps-ng >/dev/null
+      - uses: actions/checkout@v4
+      - run: echo "RESULTS=$RUNNER_TEMP/results-$JOB_LABEL.tsv" >>"$GITHUB_ENV"
+      - name: rpm
+        shell: bash
+        run: |
+          . scripts/lib.sh
+          d=$(mktemp -d)
+          curl -fsSL "$B/agent-orchestrator-linux-x64.rpm" -o "$d/a.rpm"
+          rpm -qip "$d/a.rpm" | tee "$d/meta"
+          eq rpm:version "$VERSION" "$(rpm -qp --qf '%{VERSION}' "$d/a.rpm")" "rpm Version"
+          eq rpm:license Apache-2.0 "$(rpm -qp --qf '%{LICENSE}' "$d/a.rpm")" "rpm License"
+          eq rpm:homepage https://orchestrator.inc "$(rpm -qp --qf '%{URL}' "$d/a.rpm" | sed 's#/$##')" "rpm URL"
+          rpm -K "$d/a.rpm" >"$d/sig" 2>&1; info rpm:signature "$(cat "$d/sig")"
+          start=$(date +%s)
+          if dnf install -y -q "$d/a.rpm" >"$d/install.log" 2>&1; then pass rpm:install "dnf install ./rpm ($(( $(date +%s) - start ))s)"; else fail rpm:install "$(tail -3 "$d/install.log")"; fi
+          name=$(rpm -qp --qf '%{NAME}' "$d/a.rpm")
+          eq rpm:installed-version "$VERSION" "$(rpm -q --qf '%{VERSION}' "$name")" "rpm -q version"
+          bin=$(rpm -ql "$name" | grep -E '^/usr/bin/' | head -1)
+          root=$(dirname "$(readlink -f "$bin")")
+          info rpm:files "package $name, launcher $bin -> $root"
+          bash scripts/linux-assert.sh rpm "$root" "$(rpm -ql "$name" | grep '\.desktop$' | head -1)" no
+          if ls /etc/yum.repos.d/ | grep -qi orchestrator; then pass rpm:dnf-repo "dnf repo added"; else fail rpm:dnf-repo "no dnf repository: dnf upgrade will never update the app"; fi
+          dnf remove -y -q "$name" >/dev/null 2>&1
+          left=$(ls -d "$root" "$bin" 2>/dev/null | tr '\n' ' ')
+          [ -z "$left" ] && pass rpm:uninstall-clean "dnf remove removed everything" || fail rpm:uninstall-clean "left: $left"
+      - name: Results
+        if: always()
+        shell: bash
+        run: . scripts/lib.sh && finish
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: "results-${{ env.JOB_LABEL }}", path: "${{ runner.temp }}/results-*.tsv", if-no-files-found: ignore }
+
+  linux-update:
+    needs: resolve
+    if: ${{ !inputs.skip_update }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      JOB_LABEL: linux-update
+      VERSION: ${{ needs.resolve.outputs.version }}
+      PREV: ${{ needs.resolve.outputs.prev_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "RESULTS=$RUNNER_TEMP/results-$JOB_LABEL.tsv" >>"$GITHUB_ENV"
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb libfuse2t64 >/dev/null
+      - name: AppImage N-1 -> N
+        run: |
+          . scripts/lib.sh
+          d=$(mktemp -d)
+          img="$d/Orchestrator.AppImage"
+          curl -fsSL "https://github.com/$REPO/releases/download/$PREV/agent-orchestrator-linux-x64.AppImage" -o "$img"
+          chmod +x "$img"
+          st=$d/state; mkdir -p "$st/run"
+          echo '{"enabled":true,"channel":"latest","nightlyAck":false,"feature":null}' >"$st/run/update-settings.json"
+          export AO_DATA_DIR=$st/data AO_RUN_FILE=$st/run/running.json
+          # First try exactly as a user would launch it (sandbox on).
+          timeout 40 xvfb-run -a "$img" >"$d/plain.log" 2>&1; rc=$?
+          if grep -qiE 'sandbox|SUID' "$d/plain.log"; then
+            fail linux-update:appimage-sandbox "AppImage does not start on $(. /etc/os-release; echo "$PRETTY_NAME") without --no-sandbox: $(grep -iE 'sandbox' "$d/plain.log" | head -1)"
+          else
+            info linux-update:appimage-sandbox "plain launch exit $rc (124 = still running at timeout, i.e. it started)"
+          fi
+          pkill -f "$img" 2>/dev/null || true
+          xvfb-run -a "$img" --no-sandbox >"$d/app.log" 2>&1 &
+          pending=$HOME/.cache/agent-orchestrator-updater/pending
+          got=""
+          for i in $(seq 1 120); do
+            got=$(ls "$pending"/*"$VERSION"*.AppImage 2>/dev/null | head -1)
+            [ -n "$got" ] && grep -q archive-downloaded "$st/run/logs/updater.jsonl" 2>/dev/null && break
+            sleep 10
+          done
+          if [ -n "$got" ]; then
+            want=$(curl -fsSL "https://github.com/$REPO/releases/latest/download/latest-linux.yml" | sed -n 's/^sha512: *//p')
+            have=$(openssl dgst -sha512 -binary "$got" | base64 -w0)
+            eq linux-update:n-1-to-n-staged "$want" "$have" "sha512 of staged $(basename "$got")"
+          else
+            fail linux-update:n-1-to-n-staged "no $VERSION AppImage staged in $pending after 20 min"
+            tail -30 "$d/app.log"
+          fi
+          tail -15 "$st/run/logs/updater.jsonl" 2>/dev/null || true
+          pkill -f "$img" 2>/dev/null || true
+      - name: Results
+        if: always()
+        run: . scripts/lib.sh && finish
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: "results-${{ env.JOB_LABEL }}", path: "${{ runner.temp }}/results-*.tsv", if-no-files-found: ignore }
+
+  report:
+    needs: [resolve, meta, mac-brew, mac-direct, mac-update, windows, windows-update, linux-deb-appimage, linux-rpm, linux-update]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: "results-*", merge-multiple: true, path: results }
+      - name: Combined table
+        run: |
+          cat results/*.tsv >all.tsv 2>/dev/null || true
+          {
+            echo "## Install channels: ${{ needs.resolve.outputs.tag }}"
+            echo
+            for s in FAIL KNOWN WARN PASS INFO; do printf -- "- %s: %s\n" "$s" "$(awk -F'\t' -v s=$s '$3==s' all.tsv | wc -l)"; done
+            echo
+            echo "| job | check | status | detail |"
+            echo "|---|---|---|---|"
+            awk -F'\t' 'BEGIN{o["FAIL"]=0;o["KNOWN"]=1;o["WARN"]=2;o["INFO"]=3;o["PASS"]=4} {gsub(/\|/,"\\|",$4); print o[$3]"\t| "$1" | "$2" | "$3" | "$4" |"}' all.tsv | sort -s -t$'\t' -k1,1n | cut -f2-
+          } >>"$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with: { name: all-results, path: all.tsv }
