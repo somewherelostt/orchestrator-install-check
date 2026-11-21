@@ -379,7 +379,7 @@ jobs:
           $log = "$st\run\logs\updater.jsonl"
           $sw = [Diagnostics.Stopwatch]::StartNew(); $ok = $false
           while ($sw.Elapsed.TotalMinutes -lt 20) {
-            if (Select-String -Path $log -Pattern ('"event":"archive-downloaded".*"targetVersion":"' + $env:VERSION + '"') -Quiet -ErrorAction SilentlyContinue) { $ok = $true; break }
+            if ((Test-Path $log) -and (Select-String -Path $log -Pattern ('"event":"archive-downloaded".*"targetVersion":"' + $env:VERSION + '"') -Quiet)) { $ok = $true; break }
             Start-Sleep 5
           }
           if ($ok) { Rec "win-update:n-1-to-n-downloaded" PASS "$env:PREV downloaded $env:VERSION (sha512 verified by electron-updater) in $([int]$sw.Elapsed.TotalSeconds)s" }
