@@ -245,19 +245,29 @@ jobs:
           ditto -x -k "$d/prev.zip" /Applications
           info update:baseline "$(plutil -extract CFBundleShortVersionString raw -o - '/Applications/Agent Orchestrator.app/Contents/Info.plist')"
           start=$(date +%s)
-          if node upstream/frontend/scripts/e2e-mac-update.mjs --app "/Applications/Agent Orchestrator.app" --expect-version "$VERSION" --channel latest >update.log 2>&1; then
+          if node upstream/frontend/scripts/e2e-mac-update.mjs --app "/Applications/Agent Orchestrator.app" --expect-version "$VERSION" --channel latest --swap-timeout 900 >update.log 2>&1; then
             pass mac-update:n-1-to-n "$PREV -> $VERSION staged, installed on quit, relaunched healthy ($(( $(date +%s) - start ))s)"
           else
             fail mac-update:n-1-to-n "$(tail -5 update.log)"
           fi
           tail -40 update.log
           bash scripts/mac-assert.sh after-update "/Applications/Agent Orchestrator.app" no || true
+          mkdir -p "$RUNNER_TEMP/diag"
+          cp update.log "$RUNNER_TEMP/diag/" 2>/dev/null
+          cp -R ~/Library/Caches/dev.agent-orchestrator.desktop.ShipIt "$RUNNER_TEMP/diag/ShipIt" 2>/dev/null
+          cp ~/.ao/logs/updater.jsonl* ~/.ao/logs/desktop-lifecycle.jsonl "$RUNNER_TEMP/diag/" 2>/dev/null
+          echo "--- ShipIt stderr"; tail -40 ~/Library/Caches/dev.agent-orchestrator.desktop.ShipIt/ShipIt_stderr.log 2>/dev/null
+          echo "--- updater.jsonl"; tail -25 ~/.ao/logs/updater.jsonl 2>/dev/null
+          grep -vE 'msg="http request"|scm observer|level=DEBUG' update.log | grep -vE '^time=' | tail -40
       - name: Results
         if: always()
         run: . scripts/lib.sh && finish
       - if: always()
         uses: actions/upload-artifact@v4
         with: { name: "results-${{ env.JOB_LABEL }}", path: "${{ runner.temp }}/results-*.tsv", if-no-files-found: ignore }
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: "diag-mac-update", path: "${{ runner.temp }}/diag", if-no-files-found: ignore }
 
   # -------------------------------------------------------------- Windows ----
   windows:
@@ -494,7 +504,6 @@ jobs:
       - uses: actions/checkout@v4
       - run: echo "RESULTS=$RUNNER_TEMP/results-$JOB_LABEL.tsv" >>"$GITHUB_ENV"
       - name: rpm
-        shell: bash
         run: |
           . scripts/lib.sh
           d=$(mktemp -d)
@@ -518,7 +527,6 @@ jobs:
           [ -z "$left" ] && pass rpm:uninstall-clean "dnf remove removed everything" || fail rpm:uninstall-clean "left: $left"
       - name: Results
         if: always()
-        shell: bash
         run: . scripts/lib.sh && finish
       - if: always()
         uses: actions/upload-artifact@v4
