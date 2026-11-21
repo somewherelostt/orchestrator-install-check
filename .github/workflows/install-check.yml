@@ -574,7 +574,7 @@ jobs:
           if [ "$now" = "$VERSION" ] || grep -q "\"runningVersion\":\"$VERSION\"" "$log" 2>/dev/null; then
             pass deb-update:n-1-to-n "deb updated itself to $VERSION"
           else
-            fail deb-update:n-1-to-n "deb install stays on $now and its updater never ran (events: [${ev:-none}]) ${err}"
+            fail deb-update:n-1-to-n "deb install stays on $now: its updater checks the feed but never downloads (latest-linux.yml lists only the AppImage) ${err}"
           fi
           tail -12 "$log" 2>/dev/null | cut -c1-400
           pkill -f agent-orchestrator 2>/dev/null || true
