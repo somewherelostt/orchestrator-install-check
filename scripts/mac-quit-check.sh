@@ -190,7 +190,8 @@ if brew install --cask local/quitcheck/orchestrator-quitcheck >"$d/brew-install.
 		cp "$d/brew-uninstall.log" "$diag/"
 		sleep 1
 		if grep -qi "did not quit" "$d/brew-uninstall.log"; then
-			fail quit:brew-uninstall "brew warned: $(grep -i 'did not quit' "$d/brew-uninstall.log" | head -n1 | sed 's/^[^A-Za-z]*//'); after uninstall: $(state)"
+			w=$(grep -i 'did not quit' "$d/brew-uninstall.log" | head -n1 | sed -e 's/^::warning:://' -e 's/%0A.*//' -e 's/\x1b\[[0-9;]*m//g')
+			fail quit:brew-uninstall "brew warned \"$w\"; after uninstall: $(state)"
 		elif alive "$MAIN" || alive "$DAEMON"; then
 			fail quit:brew-uninstall "no warning, but after uninstall: $(state)"
 		else
