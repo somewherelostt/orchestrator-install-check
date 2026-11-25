@@ -62,7 +62,7 @@ tray() { ax "$1" "count menu bar items of menu bar 2"; }
 MAIN= DAEMON=
 launch() {
 	kill_all
-	open "$APP"
+	open --stdout "$d/app-$1.log" --stderr "$d/app-$1.log" "$APP"
 	local port
 	for _ in $(seq 1 90); do
 		MAIN=$(main_pid)
@@ -77,6 +77,12 @@ launch() {
 		sleep 2
 	done
 	fail "quit:$1" "app did not come up (main '${MAIN}', daemon '${DAEMON}')"
+	{
+		echo "== $1"; ls -laR ~/.ao 2>&1 | head -80
+		echo "== running.json"; cat ~/.ao/running.json 2>&1
+		echo "== ps"; ps -axo pid,ppid,command | grep -v grep | grep -i -E "orchestrator|ao-daemon|/ao |tmux" | head -30
+	} >>"$diag/launch-fail.txt" 2>&1
+	cp "$d/app-$1.log" "$diag/" 2>/dev/null
 	return 1
 }
 
@@ -191,5 +197,6 @@ else
 fi
 
 kill_all
-cp ~/.ao/logs/*.log ~/.ao/logs/*.jsonl "$diag/" 2>/dev/null
+find ~/.ao \( -name "*.log" -o -name "*.jsonl" \) -size -5M -exec cp {} "$diag/" \; 2>/dev/null
+cp "$d"/app-*.log "$diag/" 2>/dev/null
 exit 0
