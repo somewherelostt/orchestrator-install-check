@@ -49,6 +49,10 @@ kill_all() {
 	[ -n "$dp" ] && kill -9 "$dp" 2>/dev/null
 	sleep 2
 	rm -f ~/.ao/running.json
+	# Answer the first-launch "Keep Orchestrator up to date automatically?"
+	# prompt up front (it blocks startup); updates stay off for this check.
+	mkdir -p ~/.ao
+	echo '{"enabled":false,"channel":"latest","nightlyAck":false,"feature":null}' >~/.ao/update-settings.json
 }
 
 # Window / tray counts through System Events (runner has Accessibility).
