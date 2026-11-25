@@ -34,10 +34,10 @@ env:
   # Remove an id once its fix ships.
   KNOWN_ISSUES: >-
     legacy-dmg-alias-still-published sha256sums arm64-linux-windows
-    page-shows-brew install-sh-old-tap install-sh-linux
-    exists:install.sh exists:install.ps1 exists:cli/install.ps1 exists:install.md
+    page-shows-brew install-sh-linux
+    exists:install.sh exists:install.ps1 exists:cli/install.ps1
     tap-binary npm-deprecated aur scoop
-    tap:ao-on-path install-sh:ao-on-path dmg:ao-on-path zip:ao-on-path
+    tap:ao-on-path dmg:ao-on-path zip:ao-on-path
     exe:ao-on-path exe:display-name exe:start-menu exe:signature exe:installer-signature
     winget:ao-on-path winget:display-name winget:start-menu winget:signature
     choco:ao-on-path choco:display-name choco:start-menu choco:signature
@@ -129,7 +129,7 @@ jobs:
           exit 0
       - name: Assert
         run: |
-          expect=no; [ "${{ matrix.channel }}" = cask ] && expect=yes
+          expect=no; [ "${{ matrix.channel }}" != tap ] && expect=yes
           LAUNCH=$([ "${{ matrix.channel }}" = cask ] && echo 1 || echo 0) \
             bash scripts/mac-assert.sh ${{ matrix.channel }} "$APP" $expect
       - name: Stale npm ao shadows the cask?
@@ -151,7 +151,11 @@ jobs:
           . scripts/lib.sh
           P=${{ matrix.channel }}
           prefix=$(brew --prefix)
-          if [ "$P" = cask ]; then tok=agent-orchestrator; else tok=agentwrapper/tap/agent-orchestrator; fi
+          # Uninstall whichever cask is actually installed: install.sh now uses
+          # the official cask, the tap channel uses agentwrapper/tap.
+          tok=$(brew list --cask --full-name 2>/dev/null | grep -E '(^|/)agent-orchestrator$' | head -1)
+          [ -n "$tok" ] || tok=agent-orchestrator
+          info "$P:uninstall-token" "$tok"
           brew uninstall --cask --zap "$tok" >uninstall.log 2>&1 || fail "$P:uninstall" "$(tail -3 uninstall.log)"
           left=""
           [ -d "$APP" ] && left="$left app;"

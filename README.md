@@ -6,7 +6,7 @@ app and its `ao` CLI, on clean GitHub-hosted runners:
 | Job | What it installs |
 |---|---|
 | `meta` | No install: release assets and aliases, updater feeds, every locale of orchestrator.inc/download, README links, install scripts, and the version Homebrew, the old tap, winget, Chocolatey and npm serve |
-| `mac-brew` | Official cask (arm64 + x64), the old `agentwrapper/tap` cask, and `orchestrator.inc/cli/install.sh` |
+| `mac-brew` | Official cask (arm64 + x64), the old `agentwrapper/tap` cask, and `orchestrator.inc/cli/install.sh` (which installs the official cask) |
 | `mac-direct` | The DMG and ZIP from `releases/latest/download` |
 | `mac-update` | Previous stable → latest through the in-app updater (upstream's own harness) |
 | `windows` | NSIS `.exe` silent install, winget, Chocolatey |
