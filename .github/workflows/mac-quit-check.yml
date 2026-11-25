@@ -4,7 +4,7 @@ name: macOS quit check
 # "after") on clean macOS runners and checks how each one handles quit
 # requests: a quit Apple Event by bundle id, Homebrew's `uninstall quit:`, and
 # the in-app Quit (Cmd-Q, confirmed in "Quit Orchestrator?"), which should keep
-# the app in the tray. Manual only. Read-only against upstream.
+# the app in the tray. Read-only against upstream.
 
 on:
   # Pushes to this workflow's own branch run it with the defaults below, so a
@@ -21,9 +21,14 @@ on:
         description: "Ref (branch or SHA) for the after build"
         required: true
         type: string
+      reuse_run:
+        description: "Optional: id of an earlier run whose app-before/app-after builds to test instead of building"
+        default: ""
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 defaults:
   run:
@@ -31,9 +36,10 @@ defaults:
 
 env:
   REPO: OrchestratorInc/agent-orchestrator
+  REUSE_RUN: ${{ inputs.reuse_run || vars.QUIT_CHECK_REUSE_RUN || '' }}
 
 jobs:
-  quit:
+  build:
     strategy:
       fail-fast: false
       matrix:
@@ -41,19 +47,20 @@ jobs:
           - { case: before, ref: "${{ inputs.before_ref || 'main' }}" }
           - { case: after, ref: "${{ inputs.after_ref || '20cef8863569ae1e6d75017ab8ae208b1a8ae189' }}" }
     runs-on: macos-latest
-    timeout-minutes: 75
-    env:
-      JOB_LABEL: quit-${{ matrix.case }}
-      HOMEBREW_NO_AUTO_UPDATE: "1"
-      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    timeout-minutes: 45
     steps:
+      - name: Reuse an earlier build
+        id: reuse
+        if: env.REUSE_RUN != ''
+        run: echo "reusing builds from run $REUSE_RUN"
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+        if: steps.reuse.outcome == 'skipped'
         with:
           repository: ${{ env.REPO }}
           ref: ${{ matrix.ref }}
           path: ao
       - uses: actions/setup-node@v4
+        if: steps.reuse.outcome == 'skipped'
         with:
           node-version: 24
           cache: npm
@@ -62,33 +69,61 @@ jobs:
             ao/packages/product-ui/package-lock.json
       # build-daemon.mjs compiles the Go daemon during prepackage.
       - uses: actions/setup-go@v5
+        if: steps.reuse.outcome == 'skipped'
         with:
           go-version-file: ao/backend/go.mod
           cache-dependency-path: ao/backend/go.sum
       - name: Install dependencies
+        if: steps.reuse.outcome == 'skipped'
         run: |
           set -e
           (cd ao/frontend && npm ci)
           (cd ao/packages/product-ui && npm ci)
       - name: Package (unsigned arm64)
+        if: steps.reuse.outcome == 'skipped'
         working-directory: ao/frontend
         run: |
           set -e
-          echo "SHA=$(git rev-parse HEAD)" >>"$GITHUB_ENV"
           # prepackage builds the daemon, browser extension, tmux, agent-browser,
           # cloudflared and the ACP runtime, as `npm run make` does for releases.
           npm run package -- --arch=arm64
           app=$(find out -maxdepth 2 -name '*.app' | head -n1)
           test -n "$app"
-          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/app.zip"
-          echo "built $app at $(git rev-parse --short HEAD)"
+          mkdir -p "$RUNNER_TEMP/pkg"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/pkg/app.zip"
+          printf '%s @ %s\n' "${{ matrix.ref }}" "$(git rev-parse HEAD)" >"$RUNNER_TEMP/pkg/ref.txt"
+          cat "$RUNNER_TEMP/pkg/ref.txt"
+      - if: steps.reuse.outcome == 'skipped'
+        uses: actions/upload-artifact@v4
+        with: { name: "app-${{ matrix.case }}", path: "${{ runner.temp }}/pkg", retention-days: 7 }
+
+  quit:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [before, after]
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      JOB_LABEL: quit-${{ matrix.case }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-${{ matrix.case }}
+          path: ${{ runner.temp }}/pkg
+          run-id: ${{ env.REUSE_RUN || github.run_id }}
+          github-token: ${{ github.token }}
       - run: echo "RESULTS=$RUNNER_TEMP/results-$JOB_LABEL.tsv" >>"$GITHUB_ENV"
       - name: Quit checks
         env:
-          ZIP: ${{ runner.temp }}/app.zip
+          ZIP: ${{ runner.temp }}/pkg/app.zip
         run: |
           . scripts/lib.sh
-          info quit:ref "${{ matrix.ref }} @ ${SHA:0:10}"
+          info quit:ref "$(cat "$RUNNER_TEMP/pkg/ref.txt")"
           bash scripts/mac-quit-check.sh
       - name: Results
         if: always()

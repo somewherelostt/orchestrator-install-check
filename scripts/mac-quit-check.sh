@@ -64,7 +64,7 @@ launch() {
 	kill_all
 	open --stdout "$d/app-$1.log" --stderr "$d/app-$1.log" "$APP"
 	local port
-	for _ in $(seq 1 90); do
+	for _ in $(seq 1 45); do
 		MAIN=$(main_pid)
 		DAEMON=$(daemon_pid)
 		port=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["port"])' ~/.ao/running.json 2>/dev/null)
@@ -78,11 +78,13 @@ launch() {
 	done
 	fail "quit:$1" "app did not come up (main '${MAIN}', daemon '${DAEMON}')"
 	{
-		echo "== $1"; ls -laR ~/.ao 2>&1 | head -80
+		echo "== $1"; ls -la ~/.ao 2>&1
+		echo "== keychains"; security list-keychains 2>&1; security show-keychain-info 2>&1
 		echo "== running.json"; cat ~/.ao/running.json 2>&1
 		echo "== ps"; ps -axo pid,ppid,command | grep -v grep | grep -i -E "orchestrator|ao-daemon|/ao |tmux" | head -30
 	} >>"$diag/launch-fail.txt" 2>&1
 	cp "$d/app-$1.log" "$diag/" 2>/dev/null
+	screencapture -x "$diag/launch-fail-$1.png" 2>/dev/null
 	return 1
 }
 
