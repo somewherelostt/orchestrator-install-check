@@ -38,12 +38,25 @@ $lnks = Get-ChildItem $startMenu -Recurse -Filter *.lnk -ErrorAction SilentlyCon
 $desk = Get-ChildItem "$env:USERPROFILE\Desktop", "$env:PUBLIC\Desktop" -Filter *.lnk -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "Orchestrator" }
 
 if ($Mode -eq "uninstalled") {
-  $left = @()
-  foreach ($d in $dirs) { if (Test-Path $d) { $left += $d } }
-  if ($entry) { $left += "uninstall registry entry '$($entry.DisplayName)'" }
-  foreach ($l in $lnks + $desk) { $left += $l.FullName }
-  if ($left.Count -eq 0) { Record "${Prefix}:uninstall-clean" PASS "no install dir, registry entry or shortcut left" }
-  else { Record "${Prefix}:uninstall-clean" FAIL ("left behind: " + ($left -join "; ")) }
+  # The NSIS uninstaller copies itself to %TEMP% and finishes there after the
+  # winget/choco/exe command returns, so poll instead of checking once.
+  function Leftovers {
+    $left = @()
+    foreach ($d in $dirs) { if (Test-Path $d) { $left += $d } }
+    $e = Get-ItemProperty $uninstKeys -ErrorAction SilentlyContinue |
+      Where-Object { $_.DisplayName -match "Orchestrator" -or $_.PSChildName -match "d06535a3" } | Select-Object -First 1
+    if ($e) { $left += "uninstall registry entry '$($e.DisplayName)'" }
+    $l1 = Get-ChildItem $startMenu -Recurse -Filter *.lnk -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "Orchestrator" }
+    $l2 = Get-ChildItem "$env:USERPROFILE\Desktop", "$env:PUBLIC\Desktop" -Filter *.lnk -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "Orchestrator" }
+    foreach ($l in @($l1) + @($l2)) { if ($l) { $left += $l.FullName } }
+    return ,$left
+  }
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $left = Leftovers
+  while ($left.Count -gt 0 -and $sw.Elapsed.TotalSeconds -lt 90) { Start-Sleep 3; $left = Leftovers }
+  $secs = [int]$sw.Elapsed.TotalSeconds
+  if ($left.Count -eq 0) { Record "${Prefix}:uninstall-clean" PASS "no install dir, registry entry or shortcut left (after ${secs}s)" }
+  else { Record "${Prefix}:uninstall-clean" FAIL ("left behind after ${secs}s: " + ($left -join "; ")) }
   $data = @("$env:APPDATA\agent-orchestrator", "$env:APPDATA\Agent Orchestrator", "$env:APPDATA\Orchestrator.inc", "$env:LOCALAPPDATA\agent-orchestrator-updater", "$env:USERPROFILE\.ao") | Where-Object { Test-Path $_ }
   Record "${Prefix}:user-data-left" INFO ("user data kept after uninstall: " + ($(if ($data) { $data -join "; " } else { "none" })))
   exit 0
