@@ -146,9 +146,14 @@ if launch in-app; then
 	if [ "${w:-0}" != 0 ] && alive "$MAIN"; then
 		screencapture -x "$diag/in-app-feedback.png" 2>/dev/null
 		osascript -e 'tell application "System Events" to key code 53' 2>>"$d/ax.err"
-		sleep 5
-		w=$(windows "$MAIN")
-		via="Cmd-Q, Escape in the exit feedback prompt"
+		# The prompt also ends on its own after 15s; either way the held Quit resumes.
+		waited=0
+		while [ "$waited" -lt 20 ]; do
+			sleep 1; waited=$((waited + 1))
+			w=$(windows "$MAIN")
+			[ "${w:-x}" = 0 ] && break
+		done
+		via="Cmd-Q held by the exit feedback prompt, resumed ${waited}s after Escape"
 	fi
 	tr=$(tray "$MAIN")
 	screencapture -x "$diag/in-app-after.png" 2>/dev/null
