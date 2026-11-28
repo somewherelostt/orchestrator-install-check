@@ -5,7 +5,8 @@
 #
 #   quit:apple-event      osascript quit by bundle id (Dock, brew, logout send
 #                         the same aevt/quit): main + daemon gone within ~5s
-#   quit:in-app           Cmd-Q, Return in "Quit Orchestrator?": window closes,
+#   quit:in-app           Cmd-Q, Return in "Quit Orchestrator?" (or Escape in the
+#                         first-day exit feedback prompt): window closes,
 #                         main + daemon + tray stay
 #   quit:after-in-app     quit Apple Event after an in-app Quit: gone within ~5s
 #   quit:brew-uninstall   brew uninstall --cask with `uninstall quit:`: no
@@ -139,15 +140,25 @@ if launch in-app; then
 	osascript -e 'tell application "System Events" to key code 36' 2>>"$d/ax.err"
 	sleep 5
 	w=$(windows "$MAIN")
+	via="Cmd-Q + Return"
+	# The first quit on day one can show the exit feedback prompt instead of
+	# "Quit Orchestrator?"; Escape skips it and the held Quit resumes.
+	if [ "${w:-0}" != 0 ] && alive "$MAIN"; then
+		screencapture -x "$diag/in-app-feedback.png" 2>/dev/null
+		osascript -e 'tell application "System Events" to key code 53' 2>>"$d/ax.err"
+		sleep 5
+		w=$(windows "$MAIN")
+		via="Cmd-Q, Escape in the exit feedback prompt"
+	fi
 	tr=$(tray "$MAIN")
 	screencapture -x "$diag/in-app-after.png" 2>/dev/null
 	if [ -s "$d/ax.err" ]; then
 		warn quit:in-app-input "System Events keystroke failed: $(head -c 200 "$d/ax.err")"
 	fi
 	if alive "$MAIN" && alive "$DAEMON" && [ "${w:-x}" = 0 ] && [ "${tr:-0}" -ge 1 ] 2>/dev/null; then
-		pass quit:in-app "windows ${before_w} -> 0, main + daemon alive, tray items ${tr}"
+		pass quit:in-app "${via}: windows ${before_w} -> 0, main + daemon alive, tray items ${tr}"
 	else
-		fail quit:in-app "after Cmd-Q + Return (windows before ${before_w}): $(state)"
+		fail quit:in-app "after ${via} (windows before ${before_w}): $(state)"
 	fi
 
 	# ---- outside quit after the app was backgrounded ----

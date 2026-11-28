@@ -45,7 +45,7 @@ jobs:
       matrix:
         include:
           - { case: before, ref: "${{ inputs.before_ref || 'main' }}" }
-          - { case: after, ref: "${{ inputs.after_ref || '20cef8863569ae1e6d75017ab8ae208b1a8ae189' }}" }
+          - { case: after, ref: "${{ inputs.after_ref || 'fd52fbd799ff5ef11fc953fd82fdbb5c8c9217dc' }}" }
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
