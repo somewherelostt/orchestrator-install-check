@@ -1,0 +1,171 @@
+name: macOS quit check
+
+# Builds an unsigned arm64 package of two Orchestrator refs ("before" and
+# "after") on clean macOS runners and checks how each one handles quit
+# requests: a quit Apple Event by bundle id, Homebrew's `uninstall quit:`, and
+# the in-app Quit (Cmd-Q, confirmed in "Quit Orchestrator?"), which should keep
+# the app in the tray. Read-only against upstream.
+
+on:
+  # Pushes to this workflow's own branch run it with the defaults below, so a
+  # change can be tried before it lands on main.
+  push:
+    branches: [mac-quit-check]
+  workflow_dispatch:
+    inputs:
+      before_ref:
+        description: "Ref for the before build"
+        default: main
+        type: string
+      after_ref:
+        description: "Ref (branch or SHA) for the after build"
+        required: true
+        type: string
+      reuse_run:
+        description: "Optional: id of an earlier run whose app-before/app-after builds to test instead of building"
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash --noprofile --norc {0}
+
+env:
+  REPO: OrchestratorInc/agent-orchestrator
+  REUSE_RUN: ${{ inputs.reuse_run || vars.QUIT_CHECK_REUSE_RUN || '' }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { case: before, ref: "${{ inputs.before_ref || 'main' }}" }
+          - { case: after, ref: "${{ inputs.after_ref || 'fd52fbd799ff5ef11fc953fd82fdbb5c8c9217dc' }}" }
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Reuse an earlier build
+        id: reuse
+        if: env.REUSE_RUN != ''
+        run: echo "reusing builds from run $REUSE_RUN"
+      - uses: actions/checkout@v4
+        if: steps.reuse.outcome == 'skipped'
+        with:
+          repository: ${{ env.REPO }}
+          ref: ${{ matrix.ref }}
+          path: ao
+      - uses: actions/setup-node@v4
+        if: steps.reuse.outcome == 'skipped'
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            ao/frontend/package-lock.json
+            ao/packages/product-ui/package-lock.json
+      # build-daemon.mjs compiles the Go daemon during prepackage.
+      - uses: actions/setup-go@v5
+        if: steps.reuse.outcome == 'skipped'
+        with:
+          go-version-file: ao/backend/go.mod
+          cache-dependency-path: ao/backend/go.sum
+      - name: Install dependencies
+        if: steps.reuse.outcome == 'skipped'
+        run: |
+          set -e
+          (cd ao/frontend && npm ci)
+          (cd ao/packages/product-ui && npm ci)
+      - name: Package (unsigned arm64)
+        if: steps.reuse.outcome == 'skipped'
+        working-directory: ao/frontend
+        run: |
+          set -e
+          # prepackage builds the daemon, browser extension, tmux, agent-browser,
+          # cloudflared and the ACP runtime, as `npm run make` does for releases.
+          npm run package -- --arch=arm64
+          app=$(find out -maxdepth 2 -name '*.app' | head -n1)
+          test -n "$app"
+          mkdir -p "$RUNNER_TEMP/pkg"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/pkg/app.zip"
+          printf '%s @ %s\n' "${{ matrix.ref }}" "$(git rev-parse HEAD)" >"$RUNNER_TEMP/pkg/ref.txt"
+          cat "$RUNNER_TEMP/pkg/ref.txt"
+      - if: steps.reuse.outcome == 'skipped'
+        uses: actions/upload-artifact@v4
+        with: { name: "app-${{ matrix.case }}", path: "${{ runner.temp }}/pkg", retention-days: 7 }
+
+  quit:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [before, after]
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      JOB_LABEL: quit-${{ matrix.case }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-${{ matrix.case }}
+          path: ${{ runner.temp }}/pkg
+          run-id: ${{ env.REUSE_RUN || github.run_id }}
+          github-token: ${{ github.token }}
+      - run: echo "RESULTS=$RUNNER_TEMP/results-$JOB_LABEL.tsv" >>"$GITHUB_ENV"
+      - name: Quit checks
+        env:
+          ZIP: ${{ runner.temp }}/pkg/app.zip
+        run: |
+          . scripts/lib.sh
+          info quit:ref "$(cat "$RUNNER_TEMP/pkg/ref.txt")"
+          bash scripts/mac-quit-check.sh
+      - name: Results
+        if: always()
+        # The before build is expected to fail; the summary job judges both.
+        run: . scripts/lib.sh && { finish || [ "${{ matrix.case }}" = before ]; }
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: "results-${{ env.JOB_LABEL }}", path: "${{ runner.temp }}/results-*.tsv", if-no-files-found: ignore }
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: "diag-${{ env.JOB_LABEL }}", path: "${{ runner.temp }}/diag", if-no-files-found: ignore }
+
+  summary:
+    needs: quit
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: "results-quit-*", merge-multiple: true, path: r }
+      - name: Before / after
+        run: |
+          b=r/results-quit-before.tsv a=r/results-quit-after.tsv
+          touch "$b" "$a"
+          get() { awk -F'\t' -v id="$2" '$2==id{s=$3; m=$4} END{ if (s=="") print "—"; else { gsub(/\|/,"\\|",m); print "**" s "** " m } }' "$1"; }
+          st() { awk -F'\t' -v id="$2" '$2==id{s=$3} END{print s}' "$1"; }
+          {
+            echo "## macOS quit check: before vs after"
+            echo
+            echo "| check | before | after |"
+            echo "|---|---|---|"
+            for id in quit:ref quit:build quit:apple-event quit:brew-uninstall quit:in-app quit:after-in-app quit:in-app-input; do
+              echo "| $id | $(get "$b" $id) | $(get "$a" $id) |"
+            done
+            echo
+          } >>"$GITHUB_STEP_SUMMARY"
+          ok=yes
+          for id in quit:apple-event quit:brew-uninstall quit:in-app quit:after-in-app; do
+            [ "$(st "$a" $id)" = PASS ] || { echo "::error::after: $id is not PASS"; ok=no; }
+          done
+          for id in quit:apple-event quit:brew-uninstall; do
+            [ "$(st "$b" $id)" = FAIL ] || echo "::warning::before: $id is $(st "$b" $id), expected FAIL"
+          done
+          [ "$(st "$b" quit:in-app)" = PASS ] || echo "::warning::before: quit:in-app is not PASS"
+          echo "after passes every check: $ok" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ $ok = yes ]
